@@ -15,7 +15,7 @@ load_dotenv()
 
 OPENROUTER_API_KEY = os.getenv(
     "OPENROUTER_API_KEY",
-    "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"
+    "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"
 )
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 

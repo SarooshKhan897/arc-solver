@@ -17,35 +17,34 @@ from src.models import color_name
 # =============================================================================
 
 PERCEIVER_SYSTEM = """You are the PERCEIVER specialist in an ARC puzzle solving system.
-Your ONLY job is to describe WHAT you see in a grid - NO hypothesis about transformations.
+Your ONLY job is to describe what you see in the grid - NO hypothesis generation.
 
 OUTPUT FORMAT (JSON):
 {
   "objects": [
-    {"id": 1, "color": "blue", "shape": "rectangle", "size": 6, "position": "top-left", "special": "hollow"},
-    {"id": 2, "color": "red", "shape": "L-shape", "size": 4, "position": "center"},
+    {"id": 1, "color": "blue", "shape": "rectangle", "size": 4, "position": "top-left", "special": ""},
     ...
   ],
   "relationships": [
-    {"type": "adjacent", "obj1": 1, "obj2": 2, "direction": "below"},
-    {"type": "inside", "obj1": 3, "obj2": 1},
+    {"type": "adjacent", "obj1": 1, "obj2": 2, "direction": "right"},
+    {"type": "contained", "outer": 1, "inner": 2},
     {"type": "aligned", "objects": [1, 2, 3], "axis": "horizontal"},
     ...
   ],
-  "global_patterns": {
-    "symmetry": "horizontal" | "vertical" | "diagonal" | "none",
-    "structure": "grid" | "scattered" | "layered" | "nested",
-    "repetition": "none" | "tiled" | "periodic"
-  },
+  "global_patterns": [
+    "grid has horizontal symmetry",
+    "objects form a 2x2 repeating pattern",
+    ...
+  ],
   "notable_features": [
-    "uniform background color (black)",
-    "objects of same size",
-    "color gradient from left to right",
+    "single red pixel at center",
+    "blue L-shaped object in corner",
     ...
   ]
 }
 
-Be PRECISE and EXHAUSTIVE. List ALL objects and their relationships."""
+Be PRECISE and EXHAUSTIVE. Describe EVERYTHING you observe.
+Do NOT suggest what the transformation might be - just describe the grid."""
 
 
 # =============================================================================
@@ -117,6 +116,16 @@ Provide your complete JSON analysis. Include any objects, relationships, or patt
             print("     Perceiver: JSON parse failed, using code fallback")
 
     # Fallback to code-based perception
+    global_patterns_list = []
+    if code_perception.symmetry.get("horizontal"):
+        global_patterns_list.append("grid has horizontal symmetry")
+    if code_perception.symmetry.get("vertical"):
+        global_patterns_list.append("grid has vertical symmetry")
+    if all_patterns['tiling'].get('is_tiled'):
+        global_patterns_list.append("objects form a tiled/repeating pattern")
+    if code_perception.patterns:
+        global_patterns_list.extend(code_perception.patterns)
+    
     fallback = {
         "objects": [
             {
@@ -129,13 +138,8 @@ Provide your complete JSON analysis. Include any objects, relationships, or patt
             for i, obj in enumerate(code_perception.objects)
         ],
         "relationships": [],
-        "global_patterns": {
-            "symmetry": "horizontal" if code_perception.symmetry.get("horizontal") else
-                       "vertical" if code_perception.symmetry.get("vertical") else "none",
-            "structure": "unknown",
-            "repetition": "tiled" if all_patterns['tiling'].get('is_tiled') else "none",
-        },
-        "notable_features": code_perception.patterns,
+        "global_patterns": global_patterns_list,
+        "notable_features": [],
         "tiling": all_patterns['tiling'],
         "frame": all_patterns['frame'],
     }

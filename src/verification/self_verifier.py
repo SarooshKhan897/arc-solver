@@ -12,7 +12,7 @@ from src.utils.grid import grid_to_text
 # Self-Verification Prompt
 # =============================================================================
 
-SELF_VERIFICATION_PROMPT = """You wrote code to solve an ARC puzzle. I ran your code on ALL {num_tests} test input(s).
+SELF_VERIFICATION_PROMPT = """You wrote code to solve an ARC puzzle. I ran your code on the TEST input.
 
 ## Your Understanding of the Pattern
 {explanation}
@@ -22,47 +22,40 @@ SELF_VERIFICATION_PROMPT = """You wrote code to solve an ARC puzzle. I ran your 
 {code}
 ```
 
-## Training Examples (ALL) - The Ground Truth
-These are the CORRECT input→output transformations that define the pattern:
+## Training Examples (ALL)
 {training_pairs}
 
 ## Test Results ({num_tests} test input(s)):
-Your code produced these outputs. Compare them against the training pattern:
 {test_results}
 
-## VERIFICATION TASK
+Look at your output. Does it match the pattern you identified in the training examples?
+Go through each element of the output and check if it matches the pattern you identified in the training examples. Are there any unexpected objects or colors. 
 
-**CRITICAL**: Compare your test outputs against the training examples. The transformation applied to test inputs should follow the EXACT same pattern as training.
+1. **SHAPE**: Training outputs had shapes: {training_output_shapes}. Do your output shapes follow the pattern?
 
-1. **TRANSFORMATION CHECK**: 
-   - Look at Training Input→Output. What transformation happened?
-   - Look at Test Input→Your Output. Did the SAME transformation happen?
-   - Does your code logic actually implement this transformation?
+2. **COLORS**: Training outputs used colors: {training_output_colors}. Do your outputs use expected colors? Any unexpected colors?
 
-2. **SHAPE**: Training outputs had shapes: {training_output_shapes}. Do your output shapes follow the same pattern relationship with inputs?
+3. **VISUAL PATTERN**: Does your output "look right" compared to training outputs?
+   - If training outputs had symmetry, does yours?
+   - If training outputs had specific structures (frames, patterns, objects), does yours?
+   - Does the transformation you applied match what happened in training?
+   - Does the training output have a consistent pattern as the inputs?
 
-3. **COLORS**: Training outputs used colors: {training_output_colors}. Do your outputs use the expected colors based on the pattern?
-
-4. **VISUAL PATTERN**: Compare side-by-side:
-   - Training: Input has X → Output has Y
-   - Test: Input has X' → Your output has Y'?
-   - Is the relationship consistent?
-
-5. **COMMON ERROR CHECK**:
-   - Off-by-one error in positions?
-   - Missing or extra objects?
-   - Wrong rotation/reflection direction?
-   - Foreground/background swapped?
-   - Index out of bounds issues?
-
-6. **CODE vs OUTPUT**: Does the code logic produce what you see in the output? Any bugs?
+4. **COMMON ERROR CHECK**:
+   - Off-by-one error (shifted by 1 row/column)?
+   - Key colors or objects missing or misplaced?
+   - Rotation/reflection in wrong direction?
+   - Foreground/background color swapped?
+   - Partial application (rule applied to some regions but not others)?
+   - Wrong anchor point (transformation centered incorrectly)?
+   - Missed edge case at boundaries?
 
 ## YOUR RESPONSE (ALL THREE REQUIRED)
 
 **VERDICT** (must be one of these three):
-- CORRECT: ALL outputs match the pattern from training examples. The transformation is consistent.
-- WRONG: One or more outputs do NOT match the expected pattern.
-- UNSURE: Something looks off but I'm not certain.
+- CORRECT: Output matches the pattern I intended. This looks right.
+- WRONG: Output does NOT match the expected pattern. [Explain what's wrong]
+- UNSURE: Something looks off but I'm not certain. [Explain concern]
 
 **SCORE** (0-100):
 - 90-100: Highly confident the outputs are correct
@@ -71,7 +64,7 @@ Your code produced these outputs. Compare them against the training pattern:
 - 30-49: Likely has issues
 - 0-29: Almost certainly wrong
 
-**FEEDBACK**: Brief explanation of your assessment. If WRONG or UNSURE, explain what's wrong and what the output SHOULD look like.
+**FEEDBACK**: If WRONG or UNSURE, explain what the output SHOULD look like and what specific cells/regions are incorrect.
 
 Format your response as:
 VERDICT: [CORRECT/WRONG/UNSURE]
