@@ -13,10 +13,7 @@ load_dotenv()
 # API Configuration
 # =============================================================================
 
-OPENROUTER_API_KEY = os.getenv(
-    "OPENROUTER_API_KEY",
-    "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"
-)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
 # Connection pooling
