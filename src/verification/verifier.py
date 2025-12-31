@@ -95,10 +95,10 @@ async def verify(
     prompt = VERIFIER_PROMPT.format(
         num_examples=len(train_examples),
         num_tests=n_tests,
-        explanation=explanation[:500] if explanation else "No explanation provided",
-        code=code[:2000],
-        examples=examples_str[:4000],
-        test_inputs=test_inputs_str[:2000],
+        explanation=explanation if explanation else "No explanation provided",
+        code=code,
+        examples=examples_str,
+        test_inputs=test_inputs_str,
     )
 
     # Call LLM

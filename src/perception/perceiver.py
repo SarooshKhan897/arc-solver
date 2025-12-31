@@ -54,6 +54,8 @@ Do NOT suggest what the transformation might be - just describe the grid."""
 async def perceive(
     grid: np.ndarray,
     verbose: bool = False,
+    max_retries: int = 3,
+    retry_delay: float = 10.0,
 ) -> dict[str, Any]:
     """
     Call Perceiver to get structured grid representation.
@@ -61,10 +63,14 @@ async def perceive(
     Args:
         grid: The grid to analyze
         verbose: Whether to print progress
+        max_retries: Number of retry attempts on JSON parse failure
+        retry_delay: Delay in seconds between retries
 
     Returns:
         Structured perception dictionary
     """
+    import asyncio
+    
     # Get code-based perception as fallback
     code_perception = perceive_grid_fast(grid)
 
@@ -90,30 +96,40 @@ CODE-DETECTED PATTERNS:
 
 Provide your complete JSON analysis. Include any objects, relationships, or patterns the code may have missed."""
 
-    # Call LLM
+    # Call LLM with retry logic for JSON parse failures
     model = get_role_model(Role.PERCEIVER)
     extra_body = get_role_extra_body(Role.PERCEIVER)
-    response, elapsed = await call_llm(
-        model=model,
-        system_prompt=PERCEIVER_SYSTEM,
-        user_prompt=user_prompt,
-        extra_body=extra_body,
-        temperature=0.3,
-    )
+    
+    last_response = ""
+    for attempt in range(max_retries):
+        response, elapsed = await call_llm(
+            model=model,
+            system_prompt=PERCEIVER_SYSTEM,
+            user_prompt=user_prompt,
+            extra_body=extra_body,
+            temperature=0.3,
+        )
+        last_response = response
 
-    # Try to parse JSON response
-    try:
-        json_match = re.search(r'\{[\s\S]*\}', response)
-        if json_match:
-            perception = json.loads(json_match.group())
-            if verbose:
-                n_objects = len(perception.get('objects', []))
-                n_relations = len(perception.get('relationships', []))
-                print(f"     Perceiver: {n_objects} objects, {n_relations} relations")
-            return perception
-    except json.JSONDecodeError:
-        if verbose:
-            print("     Perceiver: JSON parse failed, using code fallback")
+        # Try to parse JSON response
+        try:
+            json_match = re.search(r'\{[\s\S]*\}', response)
+            if json_match:
+                perception = json.loads(json_match.group())
+                if verbose:
+                    n_objects = len(perception.get('objects', []))
+                    n_relations = len(perception.get('relationships', []))
+                    print(f"     Perceiver: {n_objects} objects, {n_relations} relations")
+                return perception
+        except json.JSONDecodeError:
+            if attempt < max_retries - 1:
+                if verbose:
+                    print(f"     Perceiver: JSON parse failed, retrying in {retry_delay}s (attempt {attempt + 1}/{max_retries})...")
+                await asyncio.sleep(retry_delay)
+                continue
+            else:
+                if verbose:
+                    print("     Perceiver: JSON parse failed after retries, using code fallback")
 
     # Fallback to code-based perception
     global_patterns_list = []
@@ -145,8 +161,8 @@ Provide your complete JSON analysis. Include any objects, relationships, or patt
     }
 
     # Include raw model response for downstream use
-    if response and response.strip():
-        fallback["raw_model_analysis"] = response[:3000]
+    if last_response and last_response.strip():
+        fallback["raw_model_analysis"] = last_response
 
     return fallback
 
@@ -211,6 +227,8 @@ RULES FOR HYPOTHESES:
 async def perceive_task(
     task_data: dict[str, Any],
     verbose: bool = False,
+    max_retries: int = 3,
+    retry_delay: float = 10.0,
 ) -> dict[str, Any]:
     """
     Perceive an entire task and generate transformation hypotheses.
@@ -220,10 +238,14 @@ async def perceive_task(
     Args:
         task_data: Task with 'train' and 'test' keys
         verbose: Whether to print progress
+        max_retries: Number of retry attempts on JSON parse failure
+        retry_delay: Delay in seconds between retries
         
     Returns:
         Dict with 'observations', 'transformation_hypotheses', 'key_insight'
     """
+    import asyncio
+    
     train_examples = task_data['train']
     
     # Build prompt with all examples
@@ -275,42 +297,53 @@ Now analyze all examples and output your JSON with:
     if verbose:
         print("  👁️ Perceiver analyzing task...")
     
-    response, elapsed = await call_llm(
-        model=model,
-        system_prompt=TASK_PERCEIVER_SYSTEM,
-        user_prompt=user_prompt,
-        extra_body=extra_body,
-        temperature=0.4,  # Slight creativity for diverse hypotheses
-    )
-    
-    # Parse response
+    # Parse response with retry logic
     result = {
         "observations": {},
         "transformation_hypotheses": [],
         "key_insight": "",
-        "raw_response": response[:2000],
+        "raw_response": "",
     }
     
-    try:
-        json_match = re.search(r'\{[\s\S]*\}', response)
-        if json_match:
-            parsed = json.loads(json_match.group())
-            result["observations"] = parsed.get("observations", {})
-            result["transformation_hypotheses"] = parsed.get("transformation_hypotheses", [])[:5]
-            result["key_insight"] = parsed.get("key_insight", "")
-            
-            if verbose:
-                n_hyp = len(result["transformation_hypotheses"])
-                print(f"     ✓ Generated {n_hyp} transformation hypotheses")
-                if result["key_insight"]:
-                    insight = result["key_insight"][:60]
-                    print(f"     💡 Key insight: {insight}...")
-                    
-    except json.JSONDecodeError:
-        if verbose:
-            print("     ⚠️ JSON parse failed, extracting from text...")
-        # Try to extract hypotheses from text
-        result["transformation_hypotheses"] = _extract_hypotheses_text(response)
+    for attempt in range(max_retries):
+        response, elapsed = await call_llm(
+            model=model,
+            system_prompt=TASK_PERCEIVER_SYSTEM,
+            user_prompt=user_prompt,
+            extra_body=extra_body,
+            temperature=0.4,  # Slight creativity for diverse hypotheses
+        )
+        
+        result["raw_response"] = response
+        
+        try:
+            json_match = re.search(r'\{[\s\S]*\}', response)
+            if json_match:
+                parsed = json.loads(json_match.group())
+                result["observations"] = parsed.get("observations", {})
+                result["transformation_hypotheses"] = parsed.get("transformation_hypotheses", [])[:5]
+                result["key_insight"] = parsed.get("key_insight", "")
+                
+                if verbose:
+                    n_hyp = len(result["transformation_hypotheses"])
+                    print(f"     ✓ Generated {n_hyp} transformation hypotheses")
+                    if result["key_insight"]:
+                        insight = result["key_insight"][:60]
+                        print(f"     💡 Key insight: {insight}...")
+                
+                return result
+                        
+        except json.JSONDecodeError:
+            if attempt < max_retries - 1:
+                if verbose:
+                    print(f"     ⚠️ JSON parse failed, retrying in {retry_delay}s (attempt {attempt + 1}/{max_retries})...")
+                await asyncio.sleep(retry_delay)
+                continue
+            else:
+                if verbose:
+                    print("     ⚠️ JSON parse failed after retries, extracting from text...")
+                # Try to extract hypotheses from text
+                result["transformation_hypotheses"] = _extract_hypotheses_text(response)
     
     return result
 
@@ -331,7 +364,7 @@ def _extract_hypotheses_text(text: str) -> list[dict[str, Any]]:
                 "evidence": "",
             })
     
-    return hypotheses[:5]
+    return hypotheses
 
 
 def format_hypotheses_for_solver(hypotheses: list[dict[str, Any]]) -> str:
@@ -345,7 +378,7 @@ def format_hypotheses_for_solver(hypotheses: list[dict[str, Any]]) -> str:
         "=" * 60,
     ]
     
-    for h in hypotheses[:5]:
+    for h in hypotheses:
         rank = h.get("rank", "?")
         conf = h.get("confidence", "?")
         rule = h.get("rule", "No rule")
@@ -353,7 +386,7 @@ def format_hypotheses_for_solver(hypotheses: list[dict[str, Any]]) -> str:
         
         lines.append(f"\n#{rank} [{conf}]: {rule}")
         if evidence:
-            lines.append(f"   Evidence: {evidence[:100]}")
+            lines.append(f"   Evidence: {evidence}")
     
     return '\n'.join(lines)
 

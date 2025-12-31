@@ -117,20 +117,20 @@ def _format_perception_context(
     # Top hypotheses
     if hypotheses:
         parts.append("\n🎯 TOP TRANSFORMATION HYPOTHESES:")
-        for h in hypotheses[:3]:  # Top 3 only
+        for h in hypotheses[:5]:  # Top 5
             rank = h.get("rank", "?")
             conf = h.get("confidence", "?")
             rule = h.get("rule", "")
             conf_icon = "🟢" if conf == "HIGH" else "🟡" if conf == "MEDIUM" else "🔴"
-            parts.append(f"  {conf_icon} #{rank} [{conf}]: {rule[:150]}")
+            parts.append(f"  {conf_icon} #{rank} [{conf}]: {rule}")
     
     # Observations
     if observations:
         parts.append("\n📋 PERCEIVER OBSERVATIONS:")
         if observations.get("common_input_features"):
-            parts.append(f"  Input patterns: {', '.join(observations['common_input_features'][:3])}")
+            parts.append(f"  Input patterns: {', '.join(observations['common_input_features'])}")
         if observations.get("common_output_features"):
-            parts.append(f"  Output patterns: {', '.join(observations['common_output_features'][:3])}")
+            parts.append(f"  Output patterns: {', '.join(observations['common_output_features'])}")
         if observations.get("size_pattern"):
             parts.append(f"  Size behavior: {observations['size_pattern']}")
         if observations.get("color_changes"):
@@ -262,14 +262,14 @@ async def self_verify(
     prompt = SELF_VERIFICATION_PROMPT.format(
         num_tests=n_tests,
         perception_context=perception_context,
-        explanation=explanation[:500] if explanation else "Pattern identified from examples",
-        code=code[:3000] if code else "# Code not provided",
-        training_pairs=training_pairs[:5000],
-        test_results=test_results_str[:5000],
+        explanation=explanation if explanation else "Pattern identified from examples",
+        code=code if code else "# Code not provided",
+        training_pairs=training_pairs,
+        test_results=test_results_str,
         training_output_shapes=", ".join(training_shapes),
         training_output_colors=str(training_colors),
         your_output_colors=str(all_output_colors),
-        key_insight=verify_insight[:200],
+        key_insight=verify_insight,
     )
 
     # Use HIGH reasoning for self-verification (always)

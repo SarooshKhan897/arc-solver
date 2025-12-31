@@ -232,12 +232,12 @@ def _format_patterns_and_features(
     
     if global_patterns:
         lines.append("  Patterns:")
-        for p in global_patterns[:5]:
+        for p in global_patterns:
             lines.append(f"    • {p}")
     
     if notable_features:
         lines.append("  Notable:")
-        for f in notable_features[:5]:
+        for f in notable_features:
             lines.append(f"    • {f}")
     
     return '\n'.join(lines) if lines else "  (none detected)"
@@ -254,19 +254,19 @@ def _format_delta(delta: dict[str, Any]) -> str:
     obj_changes = delta.get('object_changes', [])
     if obj_changes:
         lines.append("  Object Changes:")
-        for change in obj_changes[:5]:
+        for change in obj_changes:
             lines.append(f"    • {change}")
     
     color_changes = delta.get('color_changes', [])
     if color_changes:
         lines.append("  Color Changes:")
-        for change in color_changes[:3]:
+        for change in color_changes:
             lines.append(f"    • {change}")
     
     structural = delta.get('structural_changes', [])
     if structural:
         lines.append("  Structural:")
-        for s in structural[:3]:
+        for s in structural:
             lines.append(f"    • {s}")
     
     constants = delta.get('constants', [])
@@ -293,7 +293,7 @@ def _format_hypotheses_section(hypotheses: list[dict[str, Any]], key_insight: st
     
     lines.append("")
     
-    for h in hypotheses[:5]:
+    for h in hypotheses:
         rank = h.get("rank", "?")
         conf = h.get("confidence", "?")
         rule = h.get("rule", "No rule specified")
@@ -305,9 +305,7 @@ def _format_hypotheses_section(hypotheses: list[dict[str, Any]], key_insight: st
         lines.append(f"  {conf_icon} #{rank} [{conf}]")
         lines.append(f"     Rule: {rule}")
         if evidence:
-            # Truncate long evidence
-            ev_short = evidence[:150] + "..." if len(evidence) > 150 else evidence
-            lines.append(f"     Evidence: {ev_short}")
+            lines.append(f"     Evidence: {evidence}")
         lines.append("")
     
     lines.append("  ⚠️ VERIFY: Before coding, mentally check your chosen hypothesis against ALL examples!")
@@ -324,11 +322,11 @@ def _format_observations(observations: dict[str, Any]) -> str:
     
     common_input = observations.get('common_input_features', [])
     if common_input:
-        lines.append(f"  Input patterns: {', '.join(common_input[:4])}")
+        lines.append(f"  Input patterns: {', '.join(common_input)}")
     
     common_output = observations.get('common_output_features', [])
     if common_output:
-        lines.append(f"  Output patterns: {', '.join(common_output[:4])}")
+        lines.append(f"  Output patterns: {', '.join(common_output)}")
     
     size_pattern = observations.get('size_pattern', '')
     if size_pattern:
@@ -438,9 +436,9 @@ def generate_prompt(
     if task_analysis:
         likely = _infer_likely_patterns(task_analysis)
         if likely:
-            parts.append(f"│  Likely Patterns: {', '.join(likely[:3])}")
+            parts.append(f"│  Likely Patterns: {', '.join(likely)}")
         if task_analysis.common_hints:
-            parts.append(f"│  Common Transforms: {', '.join(task_analysis.common_hints[:3])}")
+            parts.append(f"│  Common Transforms: {', '.join(task_analysis.common_hints)}")
     
     # Size pattern summary
     size_info = []
@@ -568,7 +566,7 @@ def generate_prompt(
             
             # Hints
             if trans_a.hints:
-                parts.append(f"     Hints: {', '.join(trans_a.hints[:4])}")
+                parts.append(f"     Hints: {', '.join(trans_a.hints)}")
 
         # Delta (if available)
         if deltas and idx < len(deltas):
@@ -654,7 +652,7 @@ def generate_prompt(
             
             tp_patterns = tp.get('global_patterns', [])
             if tp_patterns:
-                parts.append(f"\n  ✨ Patterns: {', '.join(tp_patterns[:3])}")
+                parts.append(f"\n  ✨ Patterns: {', '.join(tp_patterns)}")
 
     # =================================================================
     # SECTION 6: Feedback from Previous Attempt (if any)
