@@ -1,4 +1,4 @@
-"""Core solver - single model call with feedback loop."""
+"""Core solver - exhaustive solution collection with smart fallback."""
 
 from typing import Any
 
@@ -18,44 +18,152 @@ SELF_VERIFY_EXTRA_BODY = {"reasoning": {"effort": "high"}}
 
 
 # =============================================================================
-# Single Model Solver
+# Deduplication Helpers
 # =============================================================================
 
-async def solve_single(
+def outputs_are_equal(results1: list[np.ndarray], results2: list[np.ndarray]) -> bool:
+    """Check if two solutions produce identical output arrays for all test inputs."""
+    if len(results1) != len(results2):
+        return False
+    for arr1, arr2 in zip(results1, results2):
+        if arr1 is None or arr2 is None:
+            if arr1 is not arr2:
+                return False
+            continue
+        if arr1.shape != arr2.shape:
+            return False
+        if not np.array_equal(arr1, arr2):
+            return False
+    return True
+
+
+def get_distinct_solutions(
+    candidates: list[SolutionCandidate], 
+    target: int
+) -> list[SolutionCandidate]:
+    """
+    Select up to `target` distinct solutions (by output arrays), 
+    prioritized by verifier score.
+    
+    Returns candidates sorted by score, ensuring no two have identical outputs.
+    """
+    # Sort by score first (highest to lowest)
+    sorted_candidates = sorted(candidates, key=lambda c: -c.verifier_score)
+    
+    distinct: list[SolutionCandidate] = []
+    for cand in sorted_candidates:
+        # Check if this candidate's outputs are distinct from all selected ones
+        is_duplicate = False
+        for selected in distinct:
+            if outputs_are_equal(cand.test_results, selected.test_results):
+                is_duplicate = True
+                break
+        
+        if not is_duplicate:
+            distinct.append(cand)
+            if len(distinct) >= target:
+                break
+    
+    return distinct
+
+
+def count_distinct_high_confidence(
+    candidates: list[SolutionCandidate],
+    min_score: int
+) -> int:
+    """Count how many distinct high-confidence solutions we have."""
+    high_conf = [c for c in candidates if c.verifier_score >= min_score]
+    distinct = get_distinct_solutions(high_conf, len(high_conf))
+    return len(distinct)
+
+
+# =============================================================================
+# Alternative Approach Feedback
+# =============================================================================
+
+def generate_alternative_feedback(
+    original_prompt: str,
+    code: str,
+    explanation: str,
+    attempt_num: int,
+    previous_approaches: list[str],
+) -> str:
+    """
+    Generate feedback encouraging a fundamentally different approach.
+    Used when the current solution passes but we want more alternatives.
+    """
+    prev_summary = ""
+    if previous_approaches:
+        prev_summary = "\n".join(f"  {i+1}. {approach[:100]}..." 
+                                  for i, approach in enumerate(previous_approaches[-3:]))
+    
+    feedback_section = f"""
+
+============================================================
+✅ SOLUTION {attempt_num} PASSED - BUT TRY A DIFFERENT APPROACH
+============================================================
+
+Your solution works! However, we want to explore alternative approaches.
+
+Your current approach:
+```python
+{code[:500]}...
+```
+
+{f"Previous approaches you've tried:{chr(10)}{prev_summary}" if prev_summary else ""}
+
+NOW: Try a FUNDAMENTALLY DIFFERENT approach to solve this puzzle.
+- Don't just tweak your current solution
+- Think of a completely different way to interpret the pattern
+- Consider alternative transformation strategies from the pattern taxonomy
+- What if you approached this from the opposite direction?
+
+Provide a NEW solution with a different methodology.
+"""
+    return original_prompt + feedback_section
+
+
+# =============================================================================
+# Single Model Solver (Exhaustive with Parallel Self-Verification)
+# =============================================================================
+
+async def solve_single_exhaustive(
     task_data: dict[str, Any],
     model_config: dict[str, Any],
     perceptions: list[dict[str, Any]] | None = None,
     deltas: list[dict[str, Any]] | None = None,
     test_perception: dict[str, Any] | None = None,
     hypotheses: list[dict[str, Any]] | None = None,
+    observations: dict[str, Any] | None = None,
+    key_insight: str | None = None,
     max_tries: int | None = None,
     verbose: bool = True,
-) -> tuple[SolutionCandidate | None, SolutionCandidate | None]:
+) -> list[SolutionCandidate]:
     """
-    Solve a task using a single model with retry loop.
-
-    This is the core solving function - it:
-    1. Generates a prompt
-    2. Calls the model
-    3. Tests on training examples
-    4. If passed, self-verifies the output (always using gpt-5.2)
-    5. If failed, retries with feedback
+    Solve a task exhaustively with PARALLEL self-verification.
+    
+    Flow:
+    1. Run all tries, collecting solutions that pass training (no waiting for SV)
+    2. At the end, self-verify ALL solutions in parallel
+    3. Return all candidates with their scores
 
     Args:
         task_data: Task with 'train' and 'test' keys
-        model_config: Model configuration dict with 'id', 'model', 'extra_body', etc.
+        model_config: Model configuration dict
         perceptions: Pre-computed perceptions
         deltas: Pre-computed deltas
         test_perception: Perception of test input
-        hypotheses: Pre-computed transformation hypotheses (top 5)
+        hypotheses: Pre-computed transformation hypotheses
+        observations: Task-level observations
+        key_insight: Key insight about the puzzle
         max_tries: Override default tries from config
         verbose: Whether to print progress
 
     Returns:
-        Tuple of (self_verified_solution, training_passed_solution)
-        - self_verified_solution: Solution that passed self-verification, or None
-        - training_passed_solution: Best solution that passed training (even if self-verify failed), or None
+        List of ALL SolutionCandidates that passed training (with self-verify scores)
     """
+    import asyncio
+    
     model_id = model_config["id"]
     model = model_config["model"]
     extra_body = model_config.get("extra_body")
@@ -63,9 +171,7 @@ async def solve_single(
     tries = max_tries or model_config.get("tries", 5)
 
     train_examples = task_data['train']
-    # Get ALL test inputs
     test_inputs = [np.array(t['input']) for t in task_data['test']]
-    n_tests = len(test_inputs)
 
     # Generate initial prompt
     prompt = generate_prompt(
@@ -74,15 +180,20 @@ async def solve_single(
         deltas=deltas,
         test_perception=test_perception,
         hypotheses=hypotheses,
+        observations=observations,
+        key_insight=key_insight,
     )
 
     if verbose:
-        print(f"     🚀 [{model_id}] Starting ({tries} tries)...")
+        print(f"     🚀 [{model_id}] Starting exhaustive run ({tries} tries, parallel SV)...")
 
-    attempt_history = []
-    # Track best training-passed solution (even if self-verify fails)
-    best_training_passed: SolutionCandidate | None = None
+    # Collect solutions that pass training (don't verify yet)
+    passing_solutions: list[dict[str, Any]] = []
+    previous_approaches: list[str] = []
 
+    # =========================================================================
+    # PHASE 1: Generate solutions (sequential, but no SV wait)
+    # =========================================================================
     for attempt in range(1, tries + 1):
         try:
             # Call the model
@@ -101,7 +212,7 @@ async def solve_single(
             parsed = parse_llm_response(response)
             if not parsed['code']:
                 if verbose:
-                    print(f"     [{model_id}] Attempt {attempt}/{tries}: ✗ No code found")
+                    print(f"     [{model_id}] Try {attempt}/{tries}: ✗ No code")
                 prompt = generate_feedback_prompt(prompt, "", ["No valid code found"], attempt)
                 continue
 
@@ -110,119 +221,97 @@ async def solve_single(
 
             if not all_passed:
                 if verbose:
-                    print(f"     [{model_id}] Attempt {attempt}/{tries}: ✗ Failed training")
-                attempt_history.append({
-                    "attempt": attempt,
-                    "reason": "training_failed",
-                    "feedback": feedback_messages,
-                })
-                prompt = generate_feedback_prompt(
-                    prompt, parsed['code'], feedback_messages, attempt
-                )
+                    print(f"     [{model_id}] Try {attempt}/{tries}: ✗ Failed training")
+                prompt = generate_feedback_prompt(prompt, parsed['code'], feedback_messages, attempt)
                 continue
 
-            # Passed training! Now self-verify
+            # Passed training! Execute on test inputs
             if verbose:
-                print(f"     [{model_id}] Attempt {attempt}/{tries}: ✓ Passed training")
+                print(f"     [{model_id}] Try {attempt}/{tries}: ✓ Passed → queued for verification")
 
-            # Execute on ALL test inputs
-            test_results = []
-            for ti in test_inputs:
-                result = execute_transform(parsed['code'], ti)
-                test_results.append(result)
+            test_results = [execute_transform(parsed['code'], ti) for ti in test_inputs]
             
-            if verbose and n_tests > 1:
-                print(f"     [{model_id}] Applied transform to {n_tests} test inputs")
+            # Queue for verification (don't verify yet!)
+            passing_solutions.append({
+                'code': parsed['code'],
+                'explanation': parsed['explanation'] or '',
+                'test_results': test_results,
+                'attempt': attempt,
+            })
 
-            # Save as training-passed candidate (in case self-verify fails)
-            # We'll get the score from self-verification below
-            # For now, create a placeholder that will be updated after self-verify
-            current_code = parsed['code']
-            current_explanation = parsed['explanation'] or ''
-
-            # Self-verify using FIXED model (gpt-5.2 with high reasoning)
-            # This also gives us a score for ranking
-            if verbose:
-                print(f"     [{model_id}] 🔍 Self-verification with gpt-5.2 ({n_tests} test(s))...")
-
-            sv_result = await self_verify(
-                model=SELF_VERIFY_MODEL,  # Always use gpt-5.2
-                model_id="gpt-5.2",
-                extra_body=SELF_VERIFY_EXTRA_BODY,  # Always high reasoning
-                max_tokens=None,  # Let model decide
-                code=current_code,  # Include the generated code
-                explanation=current_explanation,
-                train_examples=train_examples,
-                test_inputs=test_inputs,  # ALL test inputs
-                test_outputs=test_results,  # ALL test outputs
-                verbose=verbose,
-            )
-
-            sv_decision = sv_result.get('decision', 'UNSURE')
-            sv_score = sv_result.get('score', 50)
-            sv_feedback = sv_result.get('feedback', '')
-
-            # Always save as training-passed candidate with the score (for fallback)
-            if best_training_passed is None or sv_score > best_training_passed.verifier_score:
-                training_passed_candidate = SolutionCandidate(
-                    code=current_code,
-                    explanation=current_explanation,
-                    model_id=model_id,
-                    verifier_score=sv_score,
-                    verifier_verdict=sv_decision,
-                    self_verify_decision="TRAINING_PASSED",
-                    attempts=attempt,
-                    test_results=test_results,
+            # Track approach and continue with alternative feedback
+            previous_approaches.append(parsed['explanation'] or f"Approach {attempt}")
+            
+            if attempt < tries:
+                prompt = generate_alternative_feedback(
+                    prompt, parsed['code'], parsed['explanation'] or '',
+                    attempt, previous_approaches
                 )
-                best_training_passed = training_passed_candidate
-
-            if sv_decision != 'CORRECT':
-                if verbose:
-                    print(f"     [{model_id}] 🔍 Self-verify: ⚠️ {sv_decision} (score={sv_score})")
-                prompt = generate_feedback_prompt(
-                    prompt,
-                    current_code,
-                    [f"Self-verification: {sv_decision}. {sv_feedback}"],
-                    attempt,
-                )
-                continue
-
-            # SUCCESS! Self-verify passed with score
-            if verbose:
-                print(f"     [{model_id}] ✅ Self-verify=CORRECT (score={sv_score})")
-                if n_tests > 1:
-                    print(f"     [{model_id}] Generated {n_tests} test outputs")
-
-            self_verified_solution = SolutionCandidate(
-                code=current_code,
-                explanation=current_explanation,
-                model_id=model_id,
-                verifier_score=sv_score,
-                verifier_verdict="APPROVED",
-                self_verify_decision=sv_decision,
-                attempts=attempt,
-                test_results=test_results,
-            )
-            return (self_verified_solution, best_training_passed)
 
         except Exception as e:
             if verbose:
-                print(f"     [{model_id}] Attempt {attempt}/{tries}: ✗ Error - {str(e)[:50]}")
-            attempt_history.append({
-                "attempt": attempt,
-                "reason": "error",
-                "error": str(e)[:100],
-            })
+                print(f"     [{model_id}] Try {attempt}/{tries}: ✗ Error - {str(e)[:50]}")
 
     if verbose:
-        print(f"     [{model_id}] ❌ Exhausted {tries} tries")
+        print(f"     [{model_id}] 📋 {len(passing_solutions)} solution(s) passed training")
 
-    # Return None for self-verified, but may have training-passed fallback
-    return (None, best_training_passed)
+    if not passing_solutions:
+        return []
+
+    # =========================================================================
+    # PHASE 2: Parallel Self-Verification
+    # =========================================================================
+    if verbose:
+        print(f"     [{model_id}] 🔍 Self-verifying {len(passing_solutions)} solution(s) in parallel...")
+
+    # Create all self-verification tasks
+    async def verify_one(sol: dict[str, Any]) -> SolutionCandidate:
+        """Self-verify a single solution and return a SolutionCandidate."""
+        sv_result = await self_verify(
+            model=SELF_VERIFY_MODEL,
+            model_id="gpt-5.2",
+            extra_body=SELF_VERIFY_EXTRA_BODY,
+            max_tokens=None,
+            code=sol['code'],
+            explanation=sol['explanation'],
+            train_examples=train_examples,
+            test_inputs=test_inputs,
+            test_outputs=sol['test_results'],
+            hypotheses=hypotheses,
+            key_insight=key_insight,
+            observations=observations,
+            perceptions=perceptions,
+            verbose=False,
+        )
+        
+        sv_decision = sv_result.get('decision', 'UNSURE')
+        sv_score = sv_result.get('score', 50)
+        
+        return SolutionCandidate(
+            code=sol['code'],
+            explanation=sol['explanation'],
+            model_id=model_id,
+            verifier_score=sv_score,
+            verifier_verdict=sv_decision,
+            self_verify_decision=sv_decision,
+            attempts=sol['attempt'],
+            test_results=sol['test_results'],
+        )
+
+    # Run all verifications in parallel
+    all_candidates = await asyncio.gather(*[verify_one(sol) for sol in passing_solutions])
+    all_candidates = list(all_candidates)
+
+    if verbose:
+        high_conf = [c for c in all_candidates if c.verifier_score >= MIN_CONFIDENCE_SCORE]
+        print(f"     [{model_id}] 📊 Finished: {len(all_candidates)} verified "
+              f"({len(high_conf)} with score {MIN_CONFIDENCE_SCORE}+)")
+
+    return all_candidates
 
 
 # =============================================================================
-# Multi-Model Parallel Solver
+# Multi-Model Solver (Exhaustive Primary + Smart Fallback)
 # =============================================================================
 
 async def solve_with_models(
@@ -231,97 +320,304 @@ async def solve_with_models(
     deltas: list[dict[str, Any]] | None = None,
     test_perception: dict[str, Any] | None = None,
     hypotheses: list[dict[str, Any]] | None = None,
+    observations: dict[str, Any] | None = None,
+    key_insight: str | None = None,
     models: list[dict[str, Any]] | None = None,
-    stop_on_success: int = 2,
+    primary_model_id: str = "gpt-5.2",
+    target_solutions: int = 2,
     verbose: bool = True,
-) -> tuple[list[SolutionCandidate], list[SolutionCandidate]]:
+) -> list[SolutionCandidate]:
     """
-    Solve a task using multiple models in parallel.
+    Solve a task with exhaustive primary model + smart fallback.
+
+    Strategy:
+    1. Run primary model (gpt-5.2) exhaustively - collect ALL solutions
+    2. Self-verify all solutions, filter for score >= 90
+    3. If we have 2+ high-confidence solutions, pick top 2 by score
+    4. If < 2, run fallback models until we have 2 total (max 10 tries each)
 
     Args:
         task_data: Task with 'train' and 'test' keys
         perceptions: Pre-computed perceptions
         deltas: Pre-computed deltas
         test_perception: Perception of test input
-        hypotheses: Pre-computed transformation hypotheses (top 5)
+        hypotheses: Pre-computed transformation hypotheses
+        observations: Task-level observations
+        key_insight: Key insight about the puzzle
         models: List of model configs (defaults to SOLVER_MODELS)
-        stop_on_success: Stop when this many solutions found from different models
+        primary_model_id: ID of the primary model (default: gpt-5.2)
+        target_solutions: Number of high-confidence solutions needed (default: 2)
         verbose: Whether to print progress
 
     Returns:
-        Tuple of (self_verified_candidates, training_passed_candidates)
-        - self_verified_candidates: Solutions that passed self-verification
-        - training_passed_candidates: Solutions that passed training (fallback)
+        List of top SolutionCandidates (up to target_solutions, sorted by score)
     """
     import asyncio
 
     if models is None:
         models = SOLVER_MODELS
 
-    self_verified: list[SolutionCandidate] = []
-    training_passed: list[SolutionCandidate] = []
-    models_with_solution: set[str] = set()
+    # Separate primary model from fallback models
+    primary_model = None
+    fallback_models = []
+    for cfg in models:
+        if cfg["id"] == primary_model_id:
+            primary_model = cfg
+        else:
+            fallback_models.append(cfg)
+
+    if primary_model is None:
+        primary_model = models[0]
+        fallback_models = models[1:]
+
+    # =========================================================================
+    # PHASE 1: Exhaustive Primary Model
+    # =========================================================================
+    if verbose:
+        print(f"  🎯 Phase 1: Running [{primary_model['id']}] exhaustively...")
+
+    all_candidates = await solve_single_exhaustive(
+        task_data=task_data,
+        model_config=primary_model,
+        perceptions=perceptions,
+        deltas=deltas,
+        test_perception=test_perception,
+        hypotheses=hypotheses,
+        observations=observations,
+        key_insight=key_insight,
+        verbose=verbose,
+    )
+
+    # =========================================================================
+    # PHASE 2: Filter for High-Confidence DISTINCT Solutions
+    # =========================================================================
+    high_confidence = [c for c in all_candidates if c.verifier_score >= MIN_CONFIDENCE_SCORE]
+    
+    # Get distinct solutions (by output arrays)
+    distinct_high_confidence = get_distinct_solutions(high_confidence, target_solutions)
+    
+    if verbose:
+        print(f"\n  📊 Phase 1 Results: {len(all_candidates)} solutions, "
+              f"{len(high_confidence)} high-confidence ({MIN_CONFIDENCE_SCORE}+), "
+              f"{len(distinct_high_confidence)} distinct")
+
+    # Check if we have enough DISTINCT solutions
+    if len(distinct_high_confidence) >= target_solutions:
+        if verbose:
+            print(f"  ✅ Got {len(distinct_high_confidence)} distinct high-confidence solutions from primary model!")
+            for i, c in enumerate(distinct_high_confidence[:target_solutions]):
+                print(f"     {i+1}. score={c.verifier_score}, attempts={c.attempts}")
+        return distinct_high_confidence[:target_solutions]
+
+    # =========================================================================
+    # PHASE 3: Run Fallback Models (Need More DISTINCT Solutions)
+    # =========================================================================
+    if not fallback_models:
+        if verbose:
+            print(f"  ⚠️ Only {len(distinct_high_confidence)} distinct high-confidence solution(s), no fallbacks configured")
+        # Return what we have (even if less than target), ensuring distinct outputs
+        all_distinct = get_distinct_solutions(all_candidates, target_solutions)
+        return all_distinct
+
+    needed = target_solutions - len(distinct_high_confidence)
+    if verbose:
+        print(f"\n  🔄 Phase 2: Need {needed} more distinct high-confidence solution(s), "
+              f"running {len(fallback_models)} fallback models...")
+
+    # Shared state for fallback coordination
+    collected_from_fallbacks: list[SolutionCandidate] = []
     stop_event = asyncio.Event()
     lock = asyncio.Lock()
+    MAX_FALLBACK_TRIES = 10
 
-    async def run_model(model_config: dict[str, Any]) -> None:
-        """Run a single model and add results to candidates."""
-        if stop_event.is_set():
-            return
+    async def run_fallback_model(model_config: dict[str, Any]) -> None:
+        """Run a fallback model, stop when we have enough high-confidence solutions."""
+        model_id = model_config["id"]
+        model = model_config["model"]
+        extra_body = model_config.get("extra_body")
+        max_tokens = model_config.get("max_tokens")
+        
+        train_examples = task_data['train']
+        test_inputs = [np.array(t['input']) for t in task_data['test']]
 
-        sv_result, tp_result = await solve_single(
+        # Generate prompt
+        prompt = generate_prompt(
             task_data=task_data,
-            model_config=model_config,
             perceptions=perceptions,
             deltas=deltas,
             test_perception=test_perception,
             hypotheses=hypotheses,
-            verbose=verbose,
+            observations=observations,
+            key_insight=key_insight,
         )
 
-        async with lock:
-            # Always track training-passed solutions (even if self-verify succeeded)
-            if tp_result and tp_result.model_id not in [c.model_id for c in training_passed]:
-                training_passed.append(tp_result)
+        if verbose:
+            print(f"     🚀 [{model_id}] Starting (up to {MAX_FALLBACK_TRIES} tries, "
+                  f"stopping when we have {target_solutions} total high-confidence)...")
 
-            # Track self-verified solutions
-            if sv_result:
-                if sv_result.model_id not in models_with_solution:
-                    self_verified.append(sv_result)
-                    models_with_solution.add(sv_result.model_id)
+        for attempt in range(1, MAX_FALLBACK_TRIES + 1):
+            # Check if we should stop
+            if stop_event.is_set():
+                if verbose:
+                    print(f"     [{model_id}] Stopping - enough solutions collected")
+                return
 
-                    is_high_confidence = sv_result.verifier_score >= MIN_CONFIDENCE_SCORE
-                    confidence_tag = "🔥" if is_high_confidence else "✅"
+            try:
+                response, elapsed = await call_llm(
+                    model=model,
+                    system_prompt=SOLVER_SYSTEM,
+                    user_prompt=prompt,
+                    extra_body=extra_body,
+                    max_tokens=max_tokens,
+                    temperature=0.7,
+                )
+
+                parsed = parse_llm_response(response)
+                if not parsed['code']:
+                    prompt = generate_feedback_prompt(prompt, "", ["No valid code found"], attempt)
+                    continue
+
+                all_passed, feedback_messages = test_on_examples(parsed['code'], train_examples)
+                if not all_passed:
+                    prompt = generate_feedback_prompt(prompt, parsed['code'], feedback_messages, attempt)
+                    continue
+
+                # Passed training - execute and self-verify
+                test_results = [execute_transform(parsed['code'], ti) for ti in test_inputs]
+
+                sv_result = await self_verify(
+                    model=SELF_VERIFY_MODEL,
+                    model_id="gpt-5.2",
+                    extra_body=SELF_VERIFY_EXTRA_BODY,
+                    max_tokens=None,
+                    code=parsed['code'],
+                    explanation=parsed['explanation'] or '',
+                    train_examples=train_examples,
+                    test_inputs=test_inputs,
+                    test_outputs=test_results,
+                    hypotheses=hypotheses,
+                    key_insight=key_insight,
+                    observations=observations,
+                    perceptions=perceptions,
+                    verbose=False,
+                )
+
+                sv_score = sv_result.get('score', 50)
+                sv_decision = sv_result.get('decision', 'UNSURE')
+
+                candidate = SolutionCandidate(
+                    code=parsed['code'],
+                    explanation=parsed['explanation'] or '',
+                    model_id=model_id,
+                    verifier_score=sv_score,
+                    verifier_verdict=sv_decision,
+                    self_verify_decision=sv_decision,
+                    attempts=attempt,
+                    test_results=test_results,
+                )
+
+                is_high_confidence = sv_score >= MIN_CONFIDENCE_SCORE
+
+                async with lock:
+                    collected_from_fallbacks.append(candidate)
                     
-                    if verbose:
-                        print(f"  {confidence_tag} [{sv_result.model_id}] Self-verified solution! "
-                              f"(score={sv_result.verifier_score})")
-
-                    # Check stop condition: need N solutions with score >= MIN_CONFIDENCE_SCORE
-                    high_confidence_solutions = [c for c in self_verified if c.verifier_score >= MIN_CONFIDENCE_SCORE]
-                    if len(high_confidence_solutions) >= stop_on_success:
+                    if is_high_confidence:
+                        # Count total DISTINCT high-confidence (primary + fallbacks)
+                        all_high_conf = distinct_high_confidence + [
+                            c for c in collected_from_fallbacks 
+                            if c.verifier_score >= MIN_CONFIDENCE_SCORE
+                        ]
+                        total_distinct = len(get_distinct_solutions(all_high_conf, target_solutions))
+                        
+                        confidence_tag = "🔥"
                         if verbose:
-                            print(f"  🎯 Got {stop_on_success} high-confidence ({MIN_CONFIDENCE_SCORE}+) solutions!")
-                        stop_event.set()
+                            print(f"     [{model_id}] {confidence_tag} High-confidence solution! "
+                                  f"(score={sv_score}, total distinct high-conf={total_distinct})")
+                        
+                        if total_distinct >= target_solutions:
+                            if verbose:
+                                print(f"  🎯 Got {target_solutions} distinct high-confidence solutions!")
+                            stop_event.set()
+                            return
+                    else:
+                        if verbose:
+                            print(f"     [{model_id}] ✅ Solution (score={sv_score}, below threshold)")
 
-    # Launch all models in parallel
-    if verbose:
-        print(f"  🚀 Launching {len(models)} models in parallel...")
+                # Continue trying for alternatives
+                prompt = generate_alternative_feedback(
+                    prompt, parsed['code'], parsed['explanation'] or '',
+                    attempt, []
+                )
 
-    tasks = [asyncio.create_task(run_model(cfg)) for cfg in models]
+            except Exception as e:
+                if verbose:
+                    print(f"     [{model_id}] Attempt {attempt}: Error - {str(e)[:50]}")
+
+        if verbose:
+            print(f"     [{model_id}] Exhausted {MAX_FALLBACK_TRIES} tries")
+
+    # Launch fallback models in parallel
+    tasks = [asyncio.create_task(run_fallback_model(cfg)) for cfg in fallback_models]
     await asyncio.gather(*tasks, return_exceptions=True)
 
+    # =========================================================================
+    # FINAL: Combine and Return Top DISTINCT Solutions
+    # =========================================================================
+    all_high_conf = high_confidence + [
+        c for c in collected_from_fallbacks 
+        if c.verifier_score >= MIN_CONFIDENCE_SCORE
+    ]
+    
+    # Get distinct high-confidence solutions first
+    final_selection = get_distinct_solutions(all_high_conf, target_solutions)
+    
+    # If we still don't have enough distinct solutions, add from lower-confidence
+    if len(final_selection) < target_solutions:
+        remaining = all_candidates + collected_from_fallbacks
+        remaining = [c for c in remaining if c not in final_selection]
+        # Get distinct from remaining
+        remaining_distinct = get_distinct_solutions(remaining, target_solutions - len(final_selection))
+        # Filter to only add those distinct from what we already have
+        for cand in remaining_distinct:
+            is_dup = any(outputs_are_equal(cand.test_results, sel.test_results) for sel in final_selection)
+            if not is_dup:
+                final_selection.append(cand)
+                if len(final_selection) >= target_solutions:
+                    break
+
     if verbose:
-        if self_verified:
-            high_conf = [c for c in self_verified if c.verifier_score >= MIN_CONFIDENCE_SCORE]
-            print(f"  ✓ Finished with {len(self_verified)} self-verified solution(s) "
-                  f"({len(high_conf)} high-confidence {MIN_CONFIDENCE_SCORE}+)")
-        elif training_passed:
-            best_score = max(c.verifier_score for c in training_passed)
-            print(f"  ⚠️ No self-verified solutions, but {len(training_passed)} training-passed fallback(s) "
-                  f"(best score={best_score})")
-        else:
-            print(f"  ❌ No solutions found")
+        print(f"\n  📊 Final Results ({len(final_selection)} distinct solutions):")
+        for i, c in enumerate(final_selection):
+            conf_tag = "🔥" if c.verifier_score >= MIN_CONFIDENCE_SCORE else "✅"
+            print(f"     {i+1}. {conf_tag} [{c.model_id}] score={c.verifier_score}")
 
-    return (self_verified, training_passed)
+    return final_selection
 
+
+# =============================================================================
+# Legacy Wrapper (for backwards compatibility)
+# =============================================================================
+
+async def solve_single(
+    task_data: dict[str, Any],
+    model_config: dict[str, Any],
+    **kwargs,
+) -> tuple[SolutionCandidate | None, SolutionCandidate | None]:
+    """
+    Legacy wrapper - returns (best_self_verified, best_training_passed).
+    Use solve_single_exhaustive for new code.
+    """
+    candidates = await solve_single_exhaustive(task_data, model_config, **kwargs)
+    
+    if not candidates:
+        return (None, None)
+    
+    # Best by score
+    candidates.sort(key=lambda c: -c.verifier_score)
+    best = candidates[0]
+    
+    # Return as (self_verified, training_passed)
+    if best.self_verify_decision == "CORRECT":
+        return (best, best)
+    else:
+        return (None, best)
