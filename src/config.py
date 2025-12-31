@@ -71,6 +71,13 @@ SOLVER_MODELS = [
         "tries": 5,
     },
     {
+        "id": "gpt-5.2-high",
+        "model": "openai/gpt-5.2",
+        "extra_body": {"reasoning": {"effort": "high"}},
+        "max_tokens": 120000,
+        "tries": 5,
+    },
+    {
         "id": "gemini-pro",
         "model": "google/gemini-3-pro-preview",
         "extra_body": {"reasoning": {"effort": "xhigh"}},
@@ -96,9 +103,10 @@ MIN_CONFIDENCE_SCORE = 90   # Minimum score to count as high-confidence
 # Model ranking for fallback selection (lower index = higher priority)
 # Used when no self-verified solutions, pick training-passed by this order
 MODEL_RANK = [
-    "gpt-5.2",           # Highest priority
-    "gemini-flash",      # Second priority
-    "gemini-pro",        # Third priority
+    "gpt-5.2",           # Highest priority (xhigh reasoning)
+    "gpt-5.2-high",      # Second priority (high reasoning fallback)
+    "gemini-flash",      # Third priority
+    "gemini-pro",        # Fourth priority
 ]
 
 

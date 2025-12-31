@@ -122,44 +122,26 @@ async def solve_task(
         if task_perception.get("key_insight"):
             print(f"     💡 Key insight: {task_perception['key_insight'][:60]}...")
 
-    # Step 4: Solve with multiple models
+    # Step 4: Solve with models (exhaustive primary + smart fallback)
     if verbose:
         print("-" * 60)
-        print("  🚀 Running parallel model execution...")
+        print("  🚀 Running exhaustive model execution...")
 
-    self_verified, training_passed = await solve_with_models(
+    candidates = await solve_with_models(
         task_data=task_data,
         perceptions=perceptions,
         deltas=deltas,
         test_perception=test_perceptions,  # Pass ALL test perceptions
         hypotheses=hypotheses,
-        stop_on_success=MIN_SOLUTIONS_REQUIRED,
+        observations=task_perception.get("observations"),
+        key_insight=task_perception.get("key_insight"),
+        target_solutions=MIN_SOLUTIONS_REQUIRED,  # Need 2 solutions for ARC
         verbose=verbose,
     )
 
-    # Step 5: Select candidates and organize predictions per test
-    # Priority: self-verified > training-passed (by model rank) > no solution
+    # Step 5: Organize predictions per test
+    # candidates is already sorted by score (top solutions)
     
-    if self_verified:
-        # Use self-verified solutions (sort by score, then model rank)
-        candidates = select_by_score_and_rank(self_verified)
-        source = 'self_verified'
-        high_conf = [c for c in candidates if c.verifier_score >= MIN_CONFIDENCE_SCORE]
-        if verbose:
-            print(f"  ✓ Using {len(candidates)} self-verified solution(s) ({len(high_conf)} with score {MIN_CONFIDENCE_SCORE}+)")
-    elif training_passed:
-        # Fallback: use training-passed solutions sorted by score, then model rank
-        candidates = select_by_score_and_rank(training_passed)
-        source = 'training_passed_fallback'
-        if verbose:
-            print(f"  ⚠️ Fallback: Using {len(candidates)} training-passed solution(s) by score")
-            for i, c in enumerate(candidates[:3]):
-                rank = MODEL_RANK.index(c.model_id) + 1 if c.model_id in MODEL_RANK else "?"
-                print(f"     {i+1}. {c.model_id} (score={c.verifier_score}, rank #{rank})")
-    else:
-        candidates = []
-        source = 'no_solution'
-
     if not candidates:
         # No solutions at all - return test inputs as fallback
         predictions_per_test = [[ti, ti] for ti in test_inputs]
@@ -170,10 +152,14 @@ async def solve_task(
             'trace_summary': TRACE_LOGGER.get_summary(),
         }
     else:
-        # Get top 2 candidates
+        # Get top 2 candidates (already sorted by score)
         top_candidates = candidates[:2]
         if len(top_candidates) == 1:
             top_candidates = [top_candidates[0], top_candidates[0]]
+        
+        # Determine source based on scores
+        high_conf = [c for c in candidates if c.verifier_score >= MIN_CONFIDENCE_SCORE]
+        source = 'high_confidence' if high_conf else 'best_available'
         
         # Organize predictions: for each test input, get [attempt1, attempt2]
         predictions_per_test = []
@@ -190,13 +176,12 @@ async def solve_task(
         info = {
             'source': source,
             'candidates_found': len(candidates),
-            'self_verified_count': len(self_verified),
-            'training_passed_count': len(training_passed),
+            'high_confidence_count': len(high_conf),
             'n_tests': n_tests,
             'winner_model': best.model_id,
             'winner_score': best.verifier_score,
             'winner_self_verify': best.self_verify_decision,
-            'models_with_solutions': [c.model_id for c in candidates],
+            'models_with_solutions': list(set(c.model_id for c in candidates)),
             'trace_summary': TRACE_LOGGER.get_summary(),
         }
 
@@ -204,10 +189,12 @@ async def solve_task(
         print("-" * 60)
         print(f"  📊 Final: {len(candidates)} candidate(s), {n_tests} test output(s)")
         if candidates:
-            source_emoji = "✅" if source == 'self_verified' else "⚠️"
-            print(f"  {source_emoji} Source: {source}")
+            high_conf_count = len([c for c in candidates if c.verifier_score >= MIN_CONFIDENCE_SCORE])
+            source_emoji = "🔥" if high_conf_count >= 2 else "✅" if high_conf_count >= 1 else "⚠️"
+            print(f"  {source_emoji} High-confidence solutions: {high_conf_count}/{len(candidates)}")
             for i, c in enumerate(candidates[:2]):
-                print(f"     {i+1}. {c.model_id}: score={c.verifier_score}, sv={c.self_verify_decision}")
+                conf = "🔥" if c.verifier_score >= MIN_CONFIDENCE_SCORE else "✅"
+                print(f"     {i+1}. {conf} [{c.model_id}]: score={c.verifier_score}")
 
     return predictions_per_test, info
 
@@ -351,22 +338,20 @@ async def run_tasks(
 
     results: list[TaskResult] = []
     completed = 0
-    total_tests = 0
-    total_correct = 0
+    total_score = 0.0  # Accumulated score (n_correct/n_test_cases per task)
 
     for coro in asyncio.as_completed(tasks):
         result = await coro
         results.append(result)
         completed += 1
         
-        # Track test-level stats
-        total_tests += result.n_test_cases
-        total_correct += result.n_correct
+        # Score per task: proportional (e.g., 1/3 correct = 0.33, 2/2 = 1.0)
+        total_score += result.score  # score = n_correct / n_test_cases
 
         if verbose and (completed % 5 == 0 or completed == total):
-            task_score = total_correct / total_tests if total_tests > 0 else 0
+            pct = total_score / completed * 100 if completed > 0 else 0
             print(f"📊 Progress: {completed}/{total} tasks, "
-                  f"{total_correct}/{total_tests} tests correct ({task_score*100:.1f}%)")
+                  f"{total_score:.1f}/{completed} score ({pct:.1f}%)")
 
     TRACE_LOGGER.enable()
 
