@@ -12,39 +12,57 @@ from src.perception.objects import compare_grids_fast
 from src.utils.grid import grid_to_text
 
 # =============================================================================
+# JSON Schema for Structured Outputs
+# =============================================================================
+
+DIFFERENCER_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "differencer_output",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "object_changes": {
+                    "type": "array",
+                    "description": "List of changes to objects (moved, deleted, created, scaled, rotated, etc.)",
+                    "items": {"type": "string"}
+                },
+                "color_changes": {
+                    "type": "array",
+                    "description": "List of color-related changes (recoloring, new colors, color removals)",
+                    "items": {"type": "string"}
+                },
+                "structural_changes": {
+                    "type": "array",
+                    "description": "Structural changes to the grid itself (size changes, tiling, merging)",
+                    "items": {"type": "string"}
+                },
+                "constants": {
+                    "type": "array",
+                    "description": "Things that stayed the same (preserved elements)",
+                    "items": {"type": "string"}
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Brief one-sentence summary of the transformation"
+                }
+            },
+            "required": ["object_changes", "color_changes", "structural_changes", "constants", "summary"],
+            "additionalProperties": False
+        }
+    }
+}
+
+# =============================================================================
 # System Prompt
 # =============================================================================
 
 DIFFERENCER_SYSTEM = """You are the DIFFERENCER specialist in an ARC puzzle solving system.
 Your ONLY job is to describe WHAT CHANGED between input and output - NO hypothesis about WHY.
 
-OUTPUT FORMAT (JSON):
-{
-  "object_changes": [
-    {"action": "moved", "object": "blue rectangle", "from": "top-left", "to": "bottom-right", "delta": [3, 2]},
-    {"action": "recolored", "object": "all red pixels", "from_color": "red", "to_color": "blue"},
-    {"action": "deleted", "object": "small green square"},
-    {"action": "created", "object": "new yellow pixel", "location": "center"},
-    {"action": "scaled", "object": "blue shape", "factor": 2},
-    {"action": "rotated", "object": "L-shape", "degrees": 90},
-    ...
-  ],
-  "structural_changes": [
-    "grid expanded from 3x3 to 6x6",
-    "objects merged into single shape",
-    "pattern was tiled 2x2",
-    ...
-  ],
-  "preserved": [
-    "background color (black)",
-    "relative positions of objects",
-    "color palette",
-    ...
-  ],
-  "summary": "Brief one-sentence summary of the transformation"
-}
-
-Be PRECISE and SPECIFIC. Focus on OBSERVABLE changes, not interpretations."""
+Be PRECISE and SPECIFIC. Focus on OBSERVABLE changes, not interpretations.
+Your output will be parsed as structured JSON."""
 
 
 # =============================================================================
@@ -57,9 +75,11 @@ async def difference(
     input_perception: dict[str, Any] | None = None,
     output_perception: dict[str, Any] | None = None,
     verbose: bool = False,
+    max_retries: int = 3,
+    retry_delay: float = 10.0,
 ) -> dict[str, Any]:
     """
-    Call Differencer to compare input/output and extract delta.
+    Call Differencer to compare input/output and extract delta using structured outputs.
 
     Args:
         input_grid: The input grid
@@ -67,10 +87,14 @@ async def difference(
         input_perception: Optional pre-computed perception of input
         output_perception: Optional pre-computed perception of output
         verbose: Whether to print progress
+        max_retries: Number of retry attempts on failure
+        retry_delay: Delay in seconds between retries
 
     Returns:
         Structured delta dictionary
     """
+    import asyncio
+    
     # Get code-based delta
     code_delta = compare_grids_fast(input_grid, output_grid)
 
@@ -93,52 +117,59 @@ CODE-DETECTED CHANGES:
     if input_perception:
         user_prompt += f"""
 INPUT PERCEPTION:
-{json.dumps(input_perception, indent=2)[:2000]}
+{json.dumps(input_perception, indent=2)}
 """
 
     if output_perception:
         user_prompt += f"""
 OUTPUT PERCEPTION:
-{json.dumps(output_perception, indent=2)[:2000]}
+{json.dumps(output_perception, indent=2)}
 """
 
-    user_prompt += "\nProvide your structured JSON analysis of what changed between input and output."
+    user_prompt += "\nProvide your analysis of what changed between input and output."
 
-    # Call LLM
+    # Call LLM with structured output format
     model = get_role_model(Role.DIFFERENCER)
     extra_body = get_role_extra_body(Role.DIFFERENCER)
-    response, elapsed = await call_llm(
-        model=model,
-        system_prompt=DIFFERENCER_SYSTEM,
-        user_prompt=user_prompt,
-        extra_body=extra_body,
-        temperature=0.3,
-    )
-
-    # Try to parse JSON response
-    try:
-        json_match = re.search(r'\{[\s\S]*\}', response)
-        if json_match:
-            delta = json.loads(json_match.group())
+    
+    for attempt in range(max_retries):
+        try:
+            response, elapsed = await call_llm(
+                model=model,
+                system_prompt=DIFFERENCER_SYSTEM,
+                user_prompt=user_prompt,
+                extra_body=extra_body,
+                temperature=0.3,
+                response_format=DIFFERENCER_SCHEMA,
+            )
+            
+            # With structured outputs, response should be valid JSON
+            delta = json.loads(response)
+            
             if verbose:
                 n_changes = len(delta.get('object_changes', []))
                 print(f"     Differencer: {n_changes} object changes detected")
+            
             return delta
-    except json.JSONDecodeError:
-        if verbose:
-            print("     Differencer: JSON parse failed, using code fallback")
+            
+        except (json.JSONDecodeError, Exception) as e:
+            if attempt < max_retries - 1:
+                if verbose:
+                    print(f"     Differencer: Error ({str(e)[:50]}), retrying in {retry_delay}s (attempt {attempt + 1}/{max_retries})...")
+                await asyncio.sleep(retry_delay)
+                continue
+            else:
+                if verbose:
+                    print("     Differencer: Failed after retries, using code fallback")
 
     # Fallback to code-based delta
     fallback = {
         "object_changes": [],
+        "color_changes": code_delta.color_changes if hasattr(code_delta, 'color_changes') else [],
         "structural_changes": [],
-        "preserved": code_delta.constants,
+        "constants": code_delta.constants if hasattr(code_delta, 'constants') else [],
         "summary": f"Size change: {code_delta.size_change}",
     }
-
-    # Include raw model response for downstream use
-    if response and response.strip():
-        fallback["raw_model_analysis"] = response[:3000]
 
     return fallback
 

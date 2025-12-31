@@ -65,6 +65,7 @@ async def call_llm(
     temperature: float = 0.7,
     max_retries: int = 5,
     base_delay: float = 5.0,
+    response_format: dict[str, Any] | None = None,
 ) -> tuple[str, float]:
     """
     Call an LLM with retry logic.
@@ -78,6 +79,7 @@ async def call_llm(
         temperature: Sampling temperature
         max_retries: Number of retry attempts
         base_delay: Base delay for exponential backoff
+        response_format: Structured output format (OpenRouter json_schema format)
 
     Returns:
         (response_content, elapsed_seconds)
@@ -101,6 +103,8 @@ async def call_llm(
                 kwargs["extra_body"] = extra_body
             if max_tokens:
                 kwargs["max_tokens"] = max_tokens
+            if response_format:
+                kwargs["response_format"] = response_format
 
             response = await client.chat.completions.create(**kwargs)
             content = response.choices[0].message.content or ""
